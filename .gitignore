@@ -1,0 +1,40 @@
+# Large data and output files (cannot be pushed to GitHub due to file size limits)
+output/*.tsv
+dataset/
+*.tsv
+
+# Submission archives
+*.zip
+*.tar.gz
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.ipynb_checkpoints/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+scratch/
+tmp/
+temp/
+*.tmp
+*.log
