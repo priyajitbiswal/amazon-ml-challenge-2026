@@ -97,6 +97,11 @@ def parse_args():
         action="store_true",
         help="Run in smoke-test mode (deterministic 50 entities, safe verification)",
     )
+    parser.add_argument(
+        "--force-blocking",
+        action="store_true",
+        help="Force re-running multi-channel blocking even if candidate_pairs.tsv already exists",
+    )
     return parser.parse_args()
 
 
@@ -158,30 +163,94 @@ def main():
     n_s1 = con.execute("SELECT count(*) FROM cur_s1").fetchone()[0]
     print(f"  Loaded {n_s1:,} Source 1 records.")
 
-    con.execute(f"""
-    CREATE OR REPLACE TABLE cur_cand_pool AS
-    SELECT entity_id, business_name, business_address, country
-    FROM read_csv('{s2_path}', delim='\\t', header=true, quote='', all_varchar=true)
-    UNION ALL
-    SELECT entity_id, business_name, business_address, country
-    FROM read_csv('{s3_path}', delim='\\t', header=true, quote='', all_varchar=true);
-    """)
-    n_cands_pool = con.execute("SELECT count(*) FROM cur_cand_pool").fetchone()[0]
-    print(f"  Loaded {n_cands_pool:,} Source 2 and Source 3 candidate records.")
+    cand_path_candidates = [
+        os.path.join(output_dir, "candidate_pairs.tsv"),
+        os.path.join(CURRENT_DIR, "output", "candidate_pairs.tsv"),
+        "output/candidate_pairs.tsv",
+    ]
+    candidate_file = None
+    for p in cand_path_candidates:
+        if os.path.exists(p):
+            candidate_file = p
+            break
 
-    # 2. Candidate Blocking
-    print("[2/5] Executing multi-channel blocking (Channels A, A2, B, C, D, E, E2, G; Cap 150)...")
-    blocker = CandidateBlocker(con)
-    t0_block = time.time()
-    block_res = blocker.generate_candidates(
-        s1_table_or_path="cur_s1",
-        cand_table_or_path="cur_cand_pool",
-        output_table="cur_candidates",
-        max_candidates_per_s1=args.cap,
-    )
-    t_block = time.time() - t0_block
-    n_candidates = block_res["total_candidates"]
-    print(f"  Blocking generated {n_candidates:,} candidate pairs in {t_block:.2f}s (avg {n_candidates/max(1, n_s1):.1f}/S1).")
+    use_existing_cands = (candidate_file is not None) and not args.force_blocking
+
+    if use_existing_cands:
+        # Fast path: load candidate pairs directly from existing candidate_pairs.tsv
+        print(f"[2/5] Loading candidate pairs from existing {candidate_file}...")
+        t0_block = time.time()
+        c_tsv_clean = candidate_file.replace("\\", "/")
+        if limit:
+            con.execute(f"""
+            CREATE OR REPLACE TABLE cur_candidates_raw AS
+            SELECT source1_entity_id, candidate_entity_ids
+            FROM read_csv('{c_tsv_clean}', delim='\\t', header=true, quote='', all_varchar=true)
+            WHERE source1_entity_id IN (SELECT entity_id FROM cur_s1);
+            """)
+        else:
+            con.execute(f"""
+            CREATE OR REPLACE TABLE cur_candidates_raw AS
+            SELECT source1_entity_id, candidate_entity_ids
+            FROM read_csv('{c_tsv_clean}', delim='\\t', header=true, quote='', all_varchar=true);
+            """)
+
+        con.execute("""
+        CREATE OR REPLACE TABLE cur_candidates AS
+        SELECT 
+            source1_entity_id,
+            unnest(string_split(candidate_entity_ids, ',')) as candidate_entity_id,
+            100 as total_priority, 1 as channels_fired, 1 as rank_order,
+            1 as fired_chan_a, 0 as fired_chan_a2, 0 as fired_chan_b, 0 as fired_chan_c,
+            0 as fired_chan_d, 0 as fired_chan_e, 0 as fired_chan_e2, 0 as fired_chan_g
+        FROM cur_candidates_raw
+        WHERE candidate_entity_ids IS NOT NULL AND candidate_entity_ids != '';
+        """)
+        n_candidates = con.execute("SELECT count(*) FROM cur_candidates").fetchone()[0]
+        print(f"  Loaded {n_candidates:,} candidate pairs in {time.time()-t0_block:.2f}s (avg {n_candidates/max(1, n_s1):.1f}/S1).")
+
+        # Ingest candidate records for these pairs
+        print("  Loading candidate details for candidate pairs...")
+        con.execute(f"""
+        CREATE OR REPLACE TABLE cur_cand_pool AS
+        SELECT entity_id, business_name, business_address, country
+        FROM read_csv('{s2_path}', delim='\\t', header=true, quote='', all_varchar=true)
+        WHERE entity_id IN (SELECT DISTINCT candidate_entity_id FROM cur_candidates)
+        UNION ALL
+        SELECT entity_id, business_name, business_address, country
+        FROM read_csv('{s3_path}', delim='\\t', header=true, quote='', all_varchar=true)
+        WHERE entity_id IN (SELECT DISTINCT candidate_entity_id FROM cur_candidates);
+        """)
+        n_cands_pool = con.execute("SELECT count(*) FROM cur_cand_pool").fetchone()[0]
+        print(f"  Loaded {n_cands_pool:,} matching candidate records.")
+    else:
+        # Full Blocking Path: execute multi-channel blocker
+        cand_limit_clause = f"LIMIT {limit * 200}" if args.smoke_test else ""
+        con.execute(f"""
+        CREATE OR REPLACE TABLE cur_cand_pool AS
+        (SELECT entity_id, business_name, business_address, country
+        FROM read_csv('{s2_path}', delim='\\t', header=true, quote='', all_varchar=true)
+        {cand_limit_clause})
+        UNION ALL
+        (SELECT entity_id, business_name, business_address, country
+        FROM read_csv('{s3_path}', delim='\\t', header=true, quote='', all_varchar=true)
+        {cand_limit_clause});
+        """)
+        n_cands_pool = con.execute("SELECT count(*) FROM cur_cand_pool").fetchone()[0]
+        print(f"  Loaded {n_cands_pool:,} Source 2 and Source 3 candidate records.")
+
+        print("[2/5] Executing multi-channel blocking (Channels A, A2, B, C, D, E, E2, G; Cap 150)...")
+        blocker = CandidateBlocker(con)
+        t0_block = time.time()
+        block_res = blocker.generate_candidates(
+            s1_table_or_path="cur_s1",
+            cand_table_or_path="cur_cand_pool",
+            output_table="cur_candidates",
+            max_candidates_per_s1=args.cap,
+        )
+        t_block = time.time() - t0_block
+        n_candidates = block_res["total_candidates"]
+        print(f"  Blocking generated {n_candidates:,} candidate pairs in {t_block:.2f}s (avg {n_candidates/max(1, n_s1):.1f}/S1).")
 
     # 3. Feature Extraction
     print("[3/5] Extracting canonical 65 features...")
