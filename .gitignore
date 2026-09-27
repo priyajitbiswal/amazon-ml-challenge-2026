@@ -1,9 +1,13 @@
-# Large data and output files (cannot be pushed to GitHub due to file size limits)
-output/*.tsv
+# Raw datasets
 dataset/
+
+# Generic TSVs (unignore official output deliverables)
 *.tsv
+!output/matching_results.tsv
+!output/candidate_pairs.tsv
 
 # Submission archives
+*.zip
 *.tar.gz
 
 # Python bytecode & cache
