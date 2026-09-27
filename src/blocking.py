@@ -44,8 +44,15 @@ class CandidateBlocker:
     Maximizes true-match recall while keeping candidate volume strictly bounded.
     """
 
-    def __init__(self, db_connection: Optional[duckdb.DuckDBPyConnection] = None):
+    def __init__(self, db_connection: Optional[duckdb.DuckDBPyConnection] = None, temp_dir: str = ".tmp_duckdb"):
         self.con = db_connection or duckdb.connect()
+        self.temp_dir = temp_dir
+        os.makedirs(self.temp_dir, exist_ok=True)
+        try:
+            self.con.execute(f"PRAGMA temp_directory='{self.temp_dir.replace(chr(92), '/')}';")
+            self.con.execute("PRAGMA preserve_insertion_order=false;")
+        except Exception:
+            pass
 
     def generate_candidates(
         self,
@@ -57,9 +64,11 @@ class CandidateBlocker:
         prefix_noise_regex: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Execute the multi-channel candidate generation and priority pruning pipeline.
+        Execute the memory-safe multi-channel candidate generation and priority pruning pipeline.
+        Partitions by country to prevent Cartesian memory explosions and strictly bounds memory footprint.
         Writes result to `output_table` with schema:
-          (source1_entity_id, candidate_entity_id, total_priority, channels_fired, rank_order)
+          (source1_entity_id, candidate_entity_id, total_priority, channels_fired, rank_order,
+           fired_chan_a, fired_chan_a2, fired_chan_b, fired_chan_c, fired_chan_d, fired_chan_e, fired_chan_e2, fired_chan_g)
         """
         t_start = time.time()
         legal_re = unambiguous_legal_regex or UNAMBIGUOUS_LEGAL_REGEX
@@ -76,335 +85,332 @@ class CandidateBlocker:
             self.con.execute(f"CREATE OR REPLACE TEMP VIEW _v_cand AS SELECT entity_id, business_name, business_address, country FROM read_csv('{cand_table_or_path}', delim='\\t', header=true, quote='', all_varchar=true);")
             cand_src = "_v_cand"
 
-        # ----------------------------------------------------------------------
-        # 1. CHANNEL A: Exact Core Name (Priority: 100)
-        # ----------------------------------------------------------------------
+        # Create output table structure
         self.con.execute(f"""
-        CREATE TEMP TABLE _chan_a AS
-        WITH s1_clean AS (
-            SELECT 
-                entity_id as s1_id, country,
-                regexp_replace(
-                    regexp_replace(replace(lower(trim(business_name)), '.', ''), '{legal_re}', '', 'g'),
-                    '[^a-z0-9]', '', 'g'
-                ) as norm_key
-            FROM {s1_src}
-            WHERE business_name IS NOT NULL AND trim(business_name) != ''
-        ),
-        cand_clean AS (
-            SELECT 
-                entity_id as candidate_id, country,
-                regexp_replace(
-                    regexp_replace(replace(lower(trim(business_name)), '.', ''), '{legal_re}', '', 'g'),
-                    '[^a-z0-9]', '', 'g'
-                ) as norm_key
-            FROM {cand_src}
-            WHERE business_name IS NOT NULL AND trim(business_name) != ''
-        )
-        SELECT s.s1_id, c.candidate_id, 100 as priority_score
-        FROM s1_clean s
-        JOIN cand_clean c ON s.country = c.country AND s.norm_key = c.norm_key
-        WHERE length(s.norm_key) >= 3;
+        CREATE OR REPLACE TABLE {output_table} (
+            source1_entity_id VARCHAR,
+            candidate_entity_id VARCHAR,
+            total_priority DOUBLE,
+            channels_fired BIGINT,
+            rank_order BIGINT,
+            fired_chan_a BIGINT,
+            fired_chan_a2 BIGINT,
+            fired_chan_b BIGINT,
+            fired_chan_c BIGINT,
+            fired_chan_d BIGINT,
+            fired_chan_e BIGINT,
+            fired_chan_e2 BIGINT,
+            fired_chan_g BIGINT
+        );
         """)
 
-        # ----------------------------------------------------------------------
-        # 2. CHANNEL A2: Prefix-Stripped Core Name (Priority: 95)
-        # ----------------------------------------------------------------------
-        self.con.execute(f"""
-        CREATE TEMP TABLE _chan_a2 AS
-        WITH s1_clean AS (
-            SELECT 
-                entity_id as s1_id, country,
-                regexp_replace(
-                    regexp_replace(
-                        regexp_replace(replace(lower(trim(business_name)), '.', ''), '{prefix_re}', '', 'g'),
-                        '{legal_re}', '', 'g'
-                    ),
-                    '[^a-z0-9]', '', 'g'
-                ) as norm_key
-            FROM {s1_src}
-            WHERE business_name IS NOT NULL AND trim(business_name) != ''
-        ),
-        cand_clean AS (
-            SELECT 
-                entity_id as candidate_id, country,
-                regexp_replace(
-                    regexp_replace(
-                        regexp_replace(replace(lower(trim(business_name)), '.', ''), '{prefix_re}', '', 'g'),
-                        '{legal_re}', '', 'g'
-                    ),
-                    '[^a-z0-9]', '', 'g'
-                ) as norm_key
-            FROM {cand_src}
-            WHERE business_name IS NOT NULL AND trim(business_name) != ''
-        )
-        SELECT s.s1_id, c.candidate_id, 95 as priority_score
-        FROM s1_clean s
-        JOIN cand_clean c ON s.country = c.country AND s.norm_key = c.norm_key
-        WHERE length(s.norm_key) >= 3;
-        """)
+        # Discover distinct countries in S1 (hard invariant: candidate.country == s1.country)
+        countries_res = self.con.execute(f"SELECT DISTINCT country FROM {s1_src} WHERE country IS NOT NULL").fetchall()
+        countries = [r[0] for r in countries_res] if countries_res else [None]
 
-        # ----------------------------------------------------------------------
-        # 3. CHANNEL B: Rare Name Tokens (DF <= 200, Priority: 80)
-        # ----------------------------------------------------------------------
-        self.con.execute(f"""
-        CREATE TEMP TABLE _cand_name_toks AS
-        SELECT country, entity_id as candidate_id,
-               unnest(string_split(regexp_replace(lower(trim(business_name)), '[^a-z0-9 ]', ' ', 'g'), ' ')) as tok
-        FROM {cand_src}
-        WHERE business_name IS NOT NULL AND trim(business_name) != '';
-        """)
-        self.con.execute("DELETE FROM _cand_name_toks WHERE length(tok) < 4;")
-        self.con.execute("""
-        CREATE TEMP TABLE _rare_name_toks AS
-        SELECT country, tok
-        FROM _cand_name_toks
-        GROUP BY country, tok
-        HAVING count(*) BETWEEN 2 AND 200;
-        """)
-        self.con.execute(f"""
-        CREATE TEMP TABLE _chan_b AS
-        WITH s1_tokens AS (
-            SELECT country, entity_id as s1_id,
+        for country in countries:
+            s1_where = f"WHERE country = '{country}'" if country is not None else ""
+            cand_where = f"WHERE country = '{country}'" if country is not None else ""
+
+            self.con.execute(f"""
+            CREATE OR REPLACE TEMP TABLE _s1_cur AS
+            SELECT entity_id as s1_id, business_name, business_address
+            FROM {s1_src} {s1_where};
+
+            CREATE OR REPLACE TEMP TABLE _cand_cur AS
+            SELECT entity_id as candidate_id, business_name, business_address
+            FROM {cand_src} {cand_where};
+            """)
+
+            # 1. CHANNEL A: Exact Core Name (Priority: 100)
+            self.con.execute(f"""
+            CREATE OR REPLACE TEMP TABLE _chan_a AS
+            WITH s1_clean AS (
+                SELECT s1_id,
+                       regexp_replace(regexp_replace(replace(lower(trim(business_name)), '.', ''), '{legal_re}', '', 'g'), '[^a-z0-9]', '', 'g') as norm_key
+                FROM _s1_cur WHERE business_name IS NOT NULL AND trim(business_name) != ''
+            ),
+            cand_clean AS (
+                SELECT candidate_id,
+                       regexp_replace(regexp_replace(replace(lower(trim(business_name)), '.', ''), '{legal_re}', '', 'g'), '[^a-z0-9]', '', 'g') as norm_key
+                FROM _cand_cur WHERE business_name IS NOT NULL AND trim(business_name) != ''
+            ),
+            raw_pairs AS (
+                SELECT s.s1_id, c.candidate_id, 100 as priority_score,
+                       row_number() OVER (PARTITION BY s.s1_id ORDER BY c.candidate_id) as rn
+                FROM s1_clean s
+                JOIN cand_clean c ON s.norm_key = c.norm_key
+                WHERE length(s.norm_key) >= 3
+            )
+            SELECT s1_id, candidate_id, priority_score FROM raw_pairs WHERE rn <= {max_candidates_per_s1};
+            """)
+
+            # 2. CHANNEL A2: Prefix-Stripped Core Name (Priority: 95)
+            self.con.execute(f"""
+            CREATE OR REPLACE TEMP TABLE _chan_a2 AS
+            WITH s1_clean AS (
+                SELECT s1_id,
+                       regexp_replace(regexp_replace(regexp_replace(replace(lower(trim(business_name)), '.', ''), '{prefix_re}', '', 'g'), '{legal_re}', '', 'g'), '[^a-z0-9]', '', 'g') as norm_key
+                FROM _s1_cur WHERE business_name IS NOT NULL AND trim(business_name) != ''
+            ),
+            cand_clean AS (
+                SELECT candidate_id,
+                       regexp_replace(regexp_replace(regexp_replace(replace(lower(trim(business_name)), '.', ''), '{prefix_re}', '', 'g'), '{legal_re}', '', 'g'), '[^a-z0-9]', '', 'g') as norm_key
+                FROM _cand_cur WHERE business_name IS NOT NULL AND trim(business_name) != ''
+            ),
+            raw_pairs AS (
+                SELECT s.s1_id, c.candidate_id, 95 as priority_score,
+                       row_number() OVER (PARTITION BY s.s1_id ORDER BY c.candidate_id) as rn
+                FROM s1_clean s
+                JOIN cand_clean c ON s.norm_key = c.norm_key
+                WHERE length(s.norm_key) >= 3
+            )
+            SELECT s1_id, candidate_id, priority_score FROM raw_pairs WHERE rn <= {max_candidates_per_s1};
+            """)
+
+            # 3. CHANNEL B: Rare Name Tokens (Priority: 80)
+            self.con.execute(f"""
+            CREATE OR REPLACE TEMP TABLE _cand_name_toks AS
+            SELECT candidate_id,
                    unnest(string_split(regexp_replace(lower(trim(business_name)), '[^a-z0-9 ]', ' ', 'g'), ' ')) as tok
-            FROM {s1_src}
-            WHERE business_name IS NOT NULL AND trim(business_name) != ''
-        )
-        SELECT DISTINCT s.s1_id, c.candidate_id, 80 as priority_score
-        FROM s1_tokens s
-        JOIN _rare_name_toks r ON s.country = r.country AND s.tok = r.tok
-        JOIN _cand_name_toks c ON s.country = c.country AND s.tok = c.tok;
-        """)
+            FROM _cand_cur WHERE business_name IS NOT NULL AND trim(business_name) != '';
+            DELETE FROM _cand_name_toks WHERE length(tok) < 4;
 
-        # ----------------------------------------------------------------------
-        # 4. CHANNEL E: Address Number + Name Prefix-3 (Priority: 75)
-        # ----------------------------------------------------------------------
-        self.con.execute(f"""
-        CREATE TEMP TABLE _chan_e AS
-        WITH s1_num AS (
-            SELECT 
-                entity_id as s1_id, country,
-                cast(ltrim(regexp_extract(business_address, '[0-9]{1,6}'), '0') as varchar) as addr_num,
-                substring(regexp_replace(lower(business_name), '[^a-z0-9]', '', 'g'), 1, 3) as p3
-            FROM {s1_src}
-            WHERE business_address IS NOT NULL AND regexp_extract(business_address, '[0-9]{1,6}') != ''
-              AND length(regexp_replace(lower(business_name), '[^a-z0-9]', '', 'g')) >= 3
-        ),
-        cand_num AS (
-            SELECT 
-                entity_id as candidate_id, country,
-                cast(ltrim(regexp_extract(business_address, '[0-9]{1,6}'), '0') as varchar) as addr_num,
-                substring(regexp_replace(lower(business_name), '[^a-z0-9]', '', 'g'), 1, 3) as p3
-            FROM {cand_src}
-            WHERE business_address IS NOT NULL AND regexp_extract(business_address, '[0-9]{1,6}') != ''
-              AND length(regexp_replace(lower(business_name), '[^a-z0-9]', '', 'g')) >= 3
-        )
-        SELECT s.s1_id, c.candidate_id, 75 as priority_score
-        FROM s1_num s
-        JOIN cand_num c ON s.country = c.country AND s.addr_num = c.addr_num AND s.p3 = c.p3
-        WHERE length(s.addr_num) > 0;
-        """)
+            CREATE OR REPLACE TEMP TABLE _rare_name_toks AS
+            SELECT tok FROM _cand_name_toks GROUP BY tok HAVING count(*) BETWEEN 2 AND 100;
 
-        # ----------------------------------------------------------------------
-        # 5. CHANNEL D: Distinctive Address Tokens (DF <= 150, Priority: 50)
-        # ----------------------------------------------------------------------
-        self.con.execute(f"""
-        CREATE TEMP TABLE _cand_addr_toks AS
-        SELECT country, entity_id as candidate_id,
-               unnest(string_split(regexp_replace(lower(trim(business_address)), '[^a-z0-9 ]', ' ', 'g'), ' ')) as tok
-        FROM {cand_src}
-        WHERE business_address IS NOT NULL AND trim(business_address) != '';
-        """)
-        self.con.execute("""
-        DELETE FROM _cand_addr_toks 
-        WHERE length(tok) < 5 
-           OR tok IN ('street', 'road', 'avenue', 'drive', 'lane', 'boulevard', 'floor', 'suite', 
-                      'apartment', 'building', 'sector', 'district', 'nagar', 'north', 'south', 
-                      'east', 'west', 'house', 'block', 'first', 'second', 'third', 'opposite', 'near');
-        """)
-        self.con.execute("""
-        CREATE TEMP TABLE _rare_addr_toks AS
-        SELECT country, tok
-        FROM _cand_addr_toks
-        GROUP BY country, tok
-        HAVING count(*) BETWEEN 2 AND 150;
-        """)
-        self.con.execute(f"""
-        CREATE TEMP TABLE _chan_d AS
-        WITH s1_tokens AS (
-            SELECT country, entity_id as s1_id,
+            CREATE OR REPLACE TEMP TABLE _chan_b AS
+            WITH s1_tokens AS (
+                SELECT s1_id,
+                       unnest(string_split(regexp_replace(lower(trim(business_name)), '[^a-z0-9 ]', ' ', 'g'), ' ')) as tok
+                FROM _s1_cur WHERE business_name IS NOT NULL AND trim(business_name) != ''
+            ),
+            raw_pairs AS (
+                SELECT DISTINCT s.s1_id, c.candidate_id, 80 as priority_score,
+                       row_number() OVER (PARTITION BY s.s1_id ORDER BY c.candidate_id) as rn
+                FROM s1_tokens s
+                JOIN _rare_name_toks r ON s.tok = r.tok
+                JOIN _cand_name_toks c ON s.tok = c.tok
+            )
+            SELECT s1_id, candidate_id, priority_score FROM raw_pairs WHERE rn <= 50;
+            """)
+
+            # 4. CHANNEL E: Address Number + Name Prefix-3 (Priority: 75)
+            self.con.execute(f"""
+            CREATE OR REPLACE TEMP TABLE _chan_e AS
+            WITH s1_num AS (
+                SELECT s1_id,
+                       cast(ltrim(regexp_extract(business_address, '[0-9]{{1,6}}'), '0') as varchar) as addr_num,
+                       substring(regexp_replace(lower(business_name), '[^a-z0-9]', '', 'g'), 1, 3) as p3
+                FROM _s1_cur
+                WHERE business_address IS NOT NULL AND regexp_extract(business_address, '[0-9]{{1,6}}') != ''
+                  AND length(regexp_replace(lower(business_name), '[^a-z0-9]', '', 'g')) >= 3
+            ),
+            cand_num AS (
+                SELECT candidate_id,
+                       cast(ltrim(regexp_extract(business_address, '[0-9]{{1,6}}'), '0') as varchar) as addr_num,
+                       substring(regexp_replace(lower(business_name), '[^a-z0-9]', '', 'g'), 1, 3) as p3
+                FROM _cand_cur
+                WHERE business_address IS NOT NULL AND regexp_extract(business_address, '[0-9]{{1,6}}') != ''
+                  AND length(regexp_replace(lower(business_name), '[^a-z0-9]', '', 'g')) >= 3
+            ),
+            raw_pairs AS (
+                SELECT s.s1_id, c.candidate_id, 75 as priority_score,
+                       row_number() OVER (PARTITION BY s.s1_id ORDER BY c.candidate_id) as rn
+                FROM s1_num s
+                JOIN cand_num c ON s.addr_num = c.addr_num AND s.p3 = c.p3
+                WHERE length(s.addr_num) > 0
+            )
+            SELECT s1_id, candidate_id, priority_score FROM raw_pairs WHERE rn <= 50;
+            """)
+
+            # 5. CHANNEL D: Distinctive Address Tokens (Priority: 50)
+            self.con.execute(f"""
+            CREATE OR REPLACE TEMP TABLE _cand_addr_toks AS
+            SELECT candidate_id,
                    unnest(string_split(regexp_replace(lower(trim(business_address)), '[^a-z0-9 ]', ' ', 'g'), ' ')) as tok
-            FROM {s1_src}
-            WHERE business_address IS NOT NULL AND trim(business_address) != ''
-        )
-        SELECT DISTINCT s.s1_id, c.candidate_id, 50 as priority_score
-        FROM s1_tokens s
-        JOIN _rare_addr_toks r ON s.country = r.country AND s.tok = r.tok
-        JOIN _cand_addr_toks c ON s.country = c.country AND s.tok = c.tok;
-        """)
+            FROM _cand_cur WHERE business_address IS NOT NULL AND trim(business_address) != '';
+            DELETE FROM _cand_addr_toks 
+            WHERE length(tok) < 5 
+               OR tok IN ('street', 'road', 'avenue', 'drive', 'lane', 'boulevard', 'floor', 'suite', 
+                          'apartment', 'building', 'sector', 'district', 'nagar', 'north', 'south', 
+                          'east', 'west', 'house', 'block', 'first', 'second', 'third', 'opposite', 'near');
 
-        # ----------------------------------------------------------------------
-        # 6. CHANNEL E2: Address Number + Distinctive Locality Anchor (Priority: 85)
-        # Recovers Native-Script Indic & Disjoint Trade Aliases without name tokens
-        # ----------------------------------------------------------------------
-        self.con.execute(f"""
-        CREATE TEMP TABLE _chan_e2 AS
-        WITH s1_addr_anchor AS (
-            SELECT 
-                entity_id as s1_id, country,
-                cast(ltrim(regexp_extract(business_address, '[0-9]{1,6}'), '0') as varchar) as num,
-                unnest(string_split(regexp_replace(lower(trim(business_address)), '[^a-z0-9 ]', ' ', 'g'), ' ')) as tok
-            FROM {s1_src} 
-            WHERE business_address IS NOT NULL AND regexp_extract(business_address, '[0-9]{1,6}') != ''
-        ),
-        cand_addr_anchor AS (
-            SELECT 
-                c.entity_id as candidate_id, c.country,
-                cast(ltrim(regexp_extract(c.business_address, '[0-9]{1,6}'), '0') as varchar) as num,
-                cat.tok
-            FROM {cand_src} c
-            JOIN _cand_addr_toks cat ON c.entity_id = cat.candidate_id
-            WHERE c.business_address IS NOT NULL AND regexp_extract(c.business_address, '[0-9]{1,6}') != ''
-        )
-        SELECT DISTINCT s.s1_id, c.candidate_id, 85 as priority_score
-        FROM s1_addr_anchor s
-        JOIN _rare_addr_toks r ON s.country = r.country AND s.tok = r.tok
-        JOIN cand_addr_anchor c ON s.country = c.country AND s.tok = c.tok AND s.num = c.num
-        WHERE length(s.num) > 0;
-        """)
+            CREATE OR REPLACE TEMP TABLE _rare_addr_toks AS
+            SELECT tok FROM _cand_addr_toks GROUP BY tok HAVING count(*) BETWEEN 2 AND 100;
 
-        # ----------------------------------------------------------------------
-        # 7. CHANNEL G: Frequency-Capped 1-Edit Initial-Char Typo Key (DF <= 150, Priority: 60)
-        # Recovers position 0 digit-letter substitutions (e.g. '6nni' vs 'Gnni', '0' vs 'O')
-        # ----------------------------------------------------------------------
-        self.con.execute(f"""
-        CREATE TEMP TABLE _cand_del_keys AS
-        SELECT country, entity_id as candidate_id,
-               substring(regexp_replace(lower(business_name), '[^a-z0-9]', '', 'g'), 2, 7) as del_key
-        FROM {cand_src}
-        WHERE length(regexp_replace(lower(business_name), '[^a-z0-9]', '', 'g')) >= 7;
-        """)
-        self.con.execute("""
-        CREATE TEMP TABLE _rare_del_keys AS
-        SELECT country, del_key
-        FROM _cand_del_keys
-        GROUP BY country, del_key
-        HAVING count(*) BETWEEN 2 AND 150;
-        """)
-        self.con.execute(f"""
-        CREATE TEMP TABLE _chan_g AS
-        WITH s1_del AS (
-            SELECT entity_id as s1_id, country,
+            CREATE OR REPLACE TEMP TABLE _chan_d AS
+            WITH s1_tokens AS (
+                SELECT s1_id,
+                       unnest(string_split(regexp_replace(lower(trim(business_address)), '[^a-z0-9 ]', ' ', 'g'), ' ')) as tok
+                FROM _s1_cur WHERE business_address IS NOT NULL AND trim(business_address) != ''
+            ),
+            raw_pairs AS (
+                SELECT DISTINCT s.s1_id, c.candidate_id, 50 as priority_score,
+                       row_number() OVER (PARTITION BY s.s1_id ORDER BY c.candidate_id) as rn
+                FROM s1_tokens s
+                JOIN _rare_addr_toks r ON s.tok = r.tok
+                JOIN _cand_addr_toks c ON s.tok = c.tok
+            )
+            SELECT s1_id, candidate_id, priority_score FROM raw_pairs WHERE rn <= 30;
+            """)
+
+            # 6. CHANNEL E2: Address Number + Distinctive Locality Anchor (Priority: 85)
+            self.con.execute(f"""
+            CREATE OR REPLACE TEMP TABLE _chan_e2 AS
+            WITH s1_addr_anchor AS (
+                SELECT s1_id,
+                       cast(ltrim(regexp_extract(business_address, '[0-9]{{1,6}}'), '0') as varchar) as num,
+                       unnest(string_split(regexp_replace(lower(trim(business_address)), '[^a-z0-9 ]', ' ', 'g'), ' ')) as tok
+                FROM _s1_cur 
+                WHERE business_address IS NOT NULL AND regexp_extract(business_address, '[0-9]{{1,6}}') != ''
+            ),
+            cand_addr_anchor AS (
+                SELECT c.candidate_id,
+                       cast(ltrim(regexp_extract(c.business_address, '[0-9]{{1,6}}'), '0') as varchar) as num,
+                       cat.tok
+                FROM _cand_cur c
+                JOIN _cand_addr_toks cat ON c.candidate_id = cat.candidate_id
+                WHERE c.business_address IS NOT NULL AND regexp_extract(c.business_address, '[0-9]{{1,6}}') != ''
+            ),
+            raw_pairs AS (
+                SELECT DISTINCT s.s1_id, c.candidate_id, 85 as priority_score,
+                       row_number() OVER (PARTITION BY s.s1_id ORDER BY c.candidate_id) as rn
+                FROM s1_addr_anchor s
+                JOIN _rare_addr_toks r ON s.tok = r.tok
+                JOIN cand_addr_anchor c ON s.tok = c.tok AND s.num = c.num
+                WHERE length(s.num) > 0
+            )
+            SELECT s1_id, candidate_id, priority_score FROM raw_pairs WHERE rn <= 50;
+            """)
+
+            # 7. CHANNEL G: Frequency-Capped 1-Edit Initial-Char Typo Key (Priority: 60)
+            self.con.execute(f"""
+            CREATE OR REPLACE TEMP TABLE _cand_del_keys AS
+            SELECT candidate_id,
                    substring(regexp_replace(lower(business_name), '[^a-z0-9]', '', 'g'), 2, 7) as del_key
-            FROM {s1_src}
-            WHERE length(regexp_replace(lower(business_name), '[^a-z0-9]', '', 'g')) >= 7
-        )
-        SELECT s.s1_id, c.candidate_id, 60 as priority_score
-        FROM s1_del s
-        JOIN _rare_del_keys r ON s.country = r.country AND s.del_key = r.del_key
-        JOIN _cand_del_keys c ON s.country = c.country AND s.del_key = c.del_key;
-        """)
+            FROM _cand_cur WHERE length(regexp_replace(lower(business_name), '[^a-z0-9]', '', 'g')) >= 7;
 
-        # ----------------------------------------------------------------------
-        # 8. CHANNEL C: Character 4-gram Prefix+Suffix Inverted Index (Priority: 40)
-        # ----------------------------------------------------------------------
-        self.con.execute(f"""
-        CREATE TEMP TABLE _chan_c AS
-        WITH s1_ngrams AS (
-            SELECT 
-                entity_id as s1_id, country,
-                substring(regexp_replace(lower(trim(business_name)), '{legal_re}', '', 'g'), 1, 4) as p4,
-                substring(regexp_replace(lower(trim(business_name)), '{legal_re}', '', 'g'), -4) as s4
-            FROM {s1_src}
-            WHERE length(regexp_replace(lower(trim(business_name)), '{legal_re}', '', 'g')) >= 5
-        ),
-        cand_ngrams AS (
-            SELECT 
-                entity_id as candidate_id, country,
-                substring(regexp_replace(lower(trim(business_name)), '{legal_re}', '', 'g'), 1, 4) as p4,
-                substring(regexp_replace(lower(trim(business_name)), '{legal_re}', '', 'g'), -4) as s4
-            FROM {cand_src}
-            WHERE length(regexp_replace(lower(trim(business_name)), '{legal_re}', '', 'g')) >= 5
-        )
-        SELECT s.s1_id, c.candidate_id, 40 as priority_score
-        FROM s1_ngrams s
-        JOIN cand_ngrams c ON s.country = c.country AND s.p4 = c.p4 AND s.s4 = c.s4;
-        """)
+            CREATE OR REPLACE TEMP TABLE _rare_del_keys AS
+            SELECT del_key FROM _cand_del_keys GROUP BY del_key HAVING count(*) BETWEEN 2 AND 100;
 
-        # ----------------------------------------------------------------------
-        # 9. CANDIDATE UNION WITH MULTI-SIGNAL PRIORITY SCORING & PRUNING
-        # ----------------------------------------------------------------------
-        self.con.execute(f"""
-        CREATE TABLE {output_table} AS
-        WITH all_channel_pairs AS (
-            SELECT s1_id, candidate_id, priority_score, 'a' as chan FROM _chan_a
-            UNION ALL
-            SELECT s1_id, candidate_id, priority_score, 'a2' as chan FROM _chan_a2
-            UNION ALL
-            SELECT s1_id, candidate_id, priority_score, 'b' as chan FROM _chan_b
-            UNION ALL
-            SELECT s1_id, candidate_id, priority_score, 'e' as chan FROM _chan_e
-            UNION ALL
-            SELECT s1_id, candidate_id, priority_score, 'e2' as chan FROM _chan_e2
-            UNION ALL
-            SELECT s1_id, candidate_id, priority_score, 'g' as chan FROM _chan_g
-            UNION ALL
-            SELECT s1_id, candidate_id, priority_score, 'd' as chan FROM _chan_d
-            UNION ALL
-            SELECT s1_id, candidate_id, priority_score, 'c' as chan FROM _chan_c
-        ),
-        aggregated AS (
-            SELECT 
-                s1_id, 
-                candidate_id, 
-                sum(priority_score) as total_priority,
-                count(DISTINCT chan) as channels_fired,
-                max(CASE WHEN chan = 'a' THEN 1 ELSE 0 END) as fired_chan_a,
-                max(CASE WHEN chan = 'a2' THEN 1 ELSE 0 END) as fired_chan_a2,
-                max(CASE WHEN chan = 'b' THEN 1 ELSE 0 END) as fired_chan_b,
-                max(CASE WHEN chan = 'c' THEN 1 ELSE 0 END) as fired_chan_c,
-                max(CASE WHEN chan = 'd' THEN 1 ELSE 0 END) as fired_chan_d,
-                max(CASE WHEN chan = 'e' THEN 1 ELSE 0 END) as fired_chan_e,
-                max(CASE WHEN chan = 'e2' THEN 1 ELSE 0 END) as fired_chan_e2,
-                max(CASE WHEN chan = 'g' THEN 1 ELSE 0 END) as fired_chan_g
-            FROM all_channel_pairs
-            GROUP BY s1_id, candidate_id
-        ),
-        ranked AS (
-            SELECT 
-                s1_id as source1_entity_id,
-                candidate_id as candidate_entity_id,
-                total_priority,
-                channels_fired,
-                fired_chan_a,
-                fired_chan_a2,
-                fired_chan_b,
-                fired_chan_c,
-                fired_chan_d,
-                fired_chan_e,
-                fired_chan_e2,
-                fired_chan_g,
-                row_number() OVER (
-                    PARTITION BY s1_id 
-                    ORDER BY total_priority DESC, channels_fired DESC, candidate_id
-                ) as rank_order
-            FROM aggregated
-        )
-        SELECT 
-            source1_entity_id, candidate_entity_id, total_priority, channels_fired, rank_order,
-            fired_chan_a, fired_chan_a2, fired_chan_b, fired_chan_c, fired_chan_d, fired_chan_e, fired_chan_e2, fired_chan_g
-        FROM ranked
-        WHERE rank_order <= {max_candidates_per_s1};
-        """)
+            CREATE OR REPLACE TEMP TABLE _chan_g AS
+            WITH s1_del AS (
+                SELECT s1_id,
+                       substring(regexp_replace(lower(business_name), '[^a-z0-9]', '', 'g'), 2, 7) as del_key
+                FROM _s1_cur WHERE length(regexp_replace(lower(business_name), '[^a-z0-9]', '', 'g')) >= 7
+            ),
+            raw_pairs AS (
+                SELECT s.s1_id, c.candidate_id, 60 as priority_score,
+                       row_number() OVER (PARTITION BY s.s1_id ORDER BY c.candidate_id) as rn
+                FROM s1_del s
+                JOIN _rare_del_keys r ON s.del_key = r.del_key
+                JOIN _cand_del_keys c ON s.del_key = c.del_key
+            )
+            SELECT s1_id, candidate_id, priority_score FROM raw_pairs WHERE rn <= 30;
+            """)
 
-        # Clean up temporary tables
-        cleanup_tables = [
-            "_chan_a", "_chan_a2", "_chan_b", "_chan_e", "_chan_e2", "_chan_g", "_chan_d", "_chan_c",
-            "_cand_name_toks", "_rare_name_toks", "_cand_addr_toks", "_rare_addr_toks",
-            "_cand_del_keys", "_rare_del_keys"
-        ]
-        for tbl in cleanup_tables:
-            self.con.execute(f"DROP TABLE IF EXISTS {tbl};")
+            # 8. CHANNEL C: Character 4-gram Prefix+Suffix Inverted Index (Priority: 40)
+            self.con.execute(f"""
+            CREATE OR REPLACE TEMP TABLE _cand_ngrams AS
+            SELECT candidate_id,
+                   substring(regexp_replace(lower(trim(business_name)), '{legal_re}', '', 'g'), 1, 4) as p4,
+                   substring(regexp_replace(lower(trim(business_name)), '{legal_re}', '', 'g'), -4) as s4
+            FROM _cand_cur WHERE length(regexp_replace(lower(trim(business_name)), '{legal_re}', '', 'g')) >= 5;
+
+            CREATE OR REPLACE TEMP TABLE _rare_ngrams AS
+            SELECT p4, s4 FROM _cand_ngrams GROUP BY p4, s4 HAVING count(*) BETWEEN 2 AND 50;
+
+            CREATE OR REPLACE TEMP TABLE _chan_c AS
+            WITH s1_ngrams AS (
+                SELECT s1_id,
+                       substring(regexp_replace(lower(trim(business_name)), '{legal_re}', '', 'g'), 1, 4) as p4,
+                       substring(regexp_replace(lower(trim(business_name)), '{legal_re}', '', 'g'), -4) as s4
+                FROM _s1_cur WHERE length(regexp_replace(lower(trim(business_name)), '{legal_re}', '', 'g')) >= 5
+            ),
+            raw_pairs AS (
+                SELECT s.s1_id, c.candidate_id, 40 as priority_score,
+                       row_number() OVER (PARTITION BY s.s1_id ORDER BY c.candidate_id) as rn
+                FROM s1_ngrams s
+                JOIN _rare_ngrams r ON s.p4 = r.p4 AND s.s4 = r.s4
+                JOIN _cand_ngrams c ON s.p4 = c.p4 AND s.s4 = c.s4
+            )
+            SELECT s1_id, candidate_id, priority_score FROM raw_pairs WHERE rn <= 30;
+            """)
+
+            # 9. UNION AND AGGREGATION FOR THIS COUNTRY
+            self.con.execute(f"""
+            INSERT INTO {output_table}
+            WITH all_channel_pairs AS (
+                SELECT s1_id, candidate_id, priority_score, 'a' as chan FROM _chan_a
+                UNION ALL
+                SELECT s1_id, candidate_id, priority_score, 'a2' as chan FROM _chan_a2
+                UNION ALL
+                SELECT s1_id, candidate_id, priority_score, 'b' as chan FROM _chan_b
+                UNION ALL
+                SELECT s1_id, candidate_id, priority_score, 'e' as chan FROM _chan_e
+                UNION ALL
+                SELECT s1_id, candidate_id, priority_score, 'e2' as chan FROM _chan_e2
+                UNION ALL
+                SELECT s1_id, candidate_id, priority_score, 'g' as chan FROM _chan_g
+                UNION ALL
+                SELECT s1_id, candidate_id, priority_score, 'd' as chan FROM _chan_d
+                UNION ALL
+                SELECT s1_id, candidate_id, priority_score, 'c' as chan FROM _chan_c
+            ),
+            aggregated AS (
+                SELECT 
+                    s1_id, 
+                    candidate_id, 
+                    sum(priority_score) as total_priority,
+                    count(DISTINCT chan) as channels_fired,
+                    max(CASE WHEN chan = 'a' THEN 1 ELSE 0 END) as fired_chan_a,
+                    max(CASE WHEN chan = 'a2' THEN 1 ELSE 0 END) as fired_chan_a2,
+                    max(CASE WHEN chan = 'b' THEN 1 ELSE 0 END) as fired_chan_b,
+                    max(CASE WHEN chan = 'c' THEN 1 ELSE 0 END) as fired_chan_c,
+                    max(CASE WHEN chan = 'd' THEN 1 ELSE 0 END) as fired_chan_d,
+                    max(CASE WHEN chan = 'e' THEN 1 ELSE 0 END) as fired_chan_e,
+                    max(CASE WHEN chan = 'e2' THEN 1 ELSE 0 END) as fired_chan_e2,
+                    max(CASE WHEN chan = 'g' THEN 1 ELSE 0 END) as fired_chan_g
+                FROM all_channel_pairs
+                GROUP BY s1_id, candidate_id
+            ),
+            ranked AS (
+                SELECT 
+                    s1_id as source1_entity_id,
+                    candidate_id as candidate_entity_id,
+                    total_priority,
+                    channels_fired,
+                    fired_chan_a,
+                    fired_chan_a2,
+                    fired_chan_b,
+                    fired_chan_c,
+                    fired_chan_d,
+                    fired_chan_e,
+                    fired_chan_e2,
+                    fired_chan_g,
+                    row_number() OVER (
+                        PARTITION BY s1_id 
+                        ORDER BY total_priority DESC, channels_fired DESC, candidate_id
+                    ) as rank_order
+                FROM aggregated
+            )
+            SELECT 
+                source1_entity_id, candidate_entity_id, total_priority, channels_fired, rank_order,
+                fired_chan_a, fired_chan_a2, fired_chan_b, fired_chan_c, fired_chan_d, fired_chan_e, fired_chan_e2, fired_chan_g
+            FROM ranked
+            WHERE rank_order <= {max_candidates_per_s1};
+            """)
+
+            # Clean up per-country temporary tables
+            cleanup_tables = [
+                "_chan_a", "_chan_a2", "_chan_b", "_chan_e", "_chan_e2", "_chan_g", "_chan_d", "_chan_c",
+                "_cand_name_toks", "_rare_name_toks", "_cand_addr_toks", "_rare_addr_toks",
+                "_cand_del_keys", "_rare_del_keys", "_cand_ngrams", "_rare_ngrams",
+                "_s1_cur", "_cand_cur"
+            ]
+            for tbl in cleanup_tables:
+                self.con.execute(f"DROP TABLE IF EXISTS {tbl};")
 
         elapsed = time.time() - t_start
         total_generated = self.con.execute(f"SELECT count(*) FROM {output_table}").fetchone()[0]

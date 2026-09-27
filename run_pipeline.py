@@ -128,7 +128,10 @@ def main():
         ],
     )
 
-    output_dir = os.path.abspath(os.path.join(CURRENT_DIR, args.output_dir)) if not os.path.isabs(args.output_dir) else args.output_dir
+    if (args.smoke_test or args.limit is not None) and args.output_dir == "output":
+        output_dir = os.path.abspath(os.path.join(CURRENT_DIR, "smoke_output"))
+    else:
+        output_dir = os.path.abspath(os.path.join(CURRENT_DIR, args.output_dir)) if not os.path.isabs(args.output_dir) else args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
     limit = 50 if args.smoke_test and args.limit is None else args.limit
@@ -144,9 +147,13 @@ def main():
     print(f"Limit (S1 Records) : {limit if limit else 'ALL (Full Test Set)'}")
     print("=" * 80)
 
-    # 1. Connect DuckDB in-memory engine
+    # 1. Connect DuckDB in-memory engine with disk spill buffer
+    tmp_duckdb_dir = os.path.join(CURRENT_DIR, ".tmp_duckdb")
+    os.makedirs(tmp_duckdb_dir, exist_ok=True)
     con = duckdb.connect()
     con.execute("PRAGMA threads=4;")
+    con.execute(f"PRAGMA temp_directory='{tmp_duckdb_dir.replace(chr(92), '/')}';")
+    con.execute("PRAGMA preserve_insertion_order=false;")
 
     s1_path = os.path.join(data_dir, "test_source1.tsv").replace("\\", "/")
     s2_path = os.path.join(data_dir, "test_source2.tsv").replace("\\", "/")
