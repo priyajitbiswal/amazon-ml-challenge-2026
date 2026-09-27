@@ -1,13 +1,8 @@
-# Raw datasets
+# Raw datasets and smoke test outputs
 dataset/
-
-# Generic TSVs (unignore official output deliverables)
-*.tsv
-!output/matching_results.tsv
-!output/candidate_pairs.tsv
+smoke_output/
 
 # Submission archives
-*.zip
 *.tar.gz
 
 # Python bytecode & cache
